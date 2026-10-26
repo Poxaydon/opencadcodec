@@ -3699,3 +3699,816 @@ fn attachment(align: i32) -> crate::entities::AttachmentPoint {
         _ => A::MiddleCenter,
     }
 }
+
+
+// Additive checked Field API. Legacy entry points above deliberately remain unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedText {
+    pub raw: Option<String>,
+    pub display: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldDiagnosticCode {
+    AdapterPreserve,
+    UnhandledAcSm,
+    InvalidIdentity,
+    InvalidHost,
+    InvalidTemplate,
+    UnsupportedCache,
+    UnsupportedChecksum,
+    ReadOnly,
+    StalePlan,
+    BlockedByPreservedChild,
+    EvaluationUnavailable,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldDiagnostic {
+    pub field: Option<Handle>,
+    pub host: Option<Handle>,
+    pub code: FieldDiagnosticCode,
+    pub message: String,
+}
+impl FieldDiagnostic {
+    pub fn preserve(message: impl Into<String>) -> Self {
+        Self {
+            field: None,
+            host: None,
+            code: FieldDiagnosticCode::AdapterPreserve,
+            message: message.into(),
+        }
+    }
+}
+fn checked_diagnostic(
+    code: FieldDiagnosticCode,
+    field: Option<Handle>,
+    host: Option<Handle>,
+    message: &str,
+) -> FieldDiagnostic {
+    FieldDiagnostic {
+        field,
+        host,
+        code,
+        message: message.into(),
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldDecision {
+    Delegate,
+    HandledValue(ResolvedText),
+    HandledPreserve(FieldDiagnostic),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutEvidence<'a> {
+    Exact {
+        handle: Handle,
+        name: &'a str,
+        block_record: Handle,
+    },
+    Missing,
+    Ambiguous,
+    Unsupported,
+}
+#[derive(Clone, Copy)]
+pub struct VerifiedStoredField<'a> {
+    document: &'a CadDocument,
+    definition: &'a FieldDef,
+    stored: &'a Field,
+    container: &'a FieldDef,
+    trigger: FieldUpdateTrigger,
+    host: Handle,
+    layout: LayoutEvidence<'a>,
+}
+impl<'a> VerifiedStoredField<'a> {
+    pub fn document(&self) -> &'a CadDocument {
+        self.document
+    }
+    pub fn definition(&self) -> &'a FieldDef {
+        self.definition
+    }
+    pub fn stored(&self) -> &'a Field {
+        self.stored
+    }
+    pub fn container(&self) -> &'a FieldDef {
+        self.container
+    }
+    pub fn trigger(&self) -> FieldUpdateTrigger {
+        self.trigger
+    }
+    pub fn host(&self) -> Handle {
+        self.host
+    }
+    pub fn layout(&self) -> LayoutEvidence<'a> {
+        self.layout
+    }
+    pub fn source_path(&self) -> Option<&'a str> {
+        self.document.source_path.as_deref()
+    }
+}
+#[derive(Clone, Copy)]
+pub struct VerifiedPreview<'a> {
+    document: &'a CadDocument,
+    code: &'a str,
+    objects: &'a [Handle],
+    host: Option<Handle>,
+    layout: LayoutEvidence<'a>,
+}
+impl<'a> VerifiedPreview<'a> {
+    pub fn document(&self) -> &'a CadDocument {
+        self.document
+    }
+    pub fn code(&self) -> &'a str {
+        self.code
+    }
+    pub fn objects(&self) -> &'a [Handle] {
+        self.objects
+    }
+    pub fn host(&self) -> Option<Handle> {
+        self.host
+    }
+    pub fn layout(&self) -> LayoutEvidence<'a> {
+        self.layout
+    }
+    pub fn source_path(&self) -> Option<&'a str> {
+        self.document.source_path.as_deref()
+    }
+}
+#[derive(Clone, Copy)]
+pub enum FieldEvaluation<'a> {
+    Stored(VerifiedStoredField<'a>),
+    Preview(VerifiedPreview<'a>),
+}
+pub trait FieldInterceptor {
+    fn intercept(&self, _input: FieldEvaluation<'_>) -> FieldDecision {
+        FieldDecision::Delegate
+    }
+}
+pub struct PreviewRequest<'a> {
+    pub code: &'a str,
+    pub objects: &'a [Handle],
+    pub host: Option<Handle>,
+    /// Explicit identity, validated against the document. Never CTAB fallback.
+    pub layout: Option<Handle>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckedEvaluation {
+    Value(ResolvedText),
+    Preserved(FieldDiagnostic),
+}
+fn acsm_family(code: &str, evaluator: &str) -> bool {
+    let body = code
+        .trim()
+        .strip_prefix("%<")
+        .and_then(|s| s.strip_suffix(">%"))
+        .unwrap_or(code.trim());
+    [
+        evaluator,
+        body.trim()
+            .trim_start_matches(char::from(92))
+            .split_whitespace()
+            .next()
+            .unwrap_or(""),
+    ]
+    .iter()
+    .any(|s| s.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("AcSm")))
+}
+fn exact_host_layout(doc: &CadDocument, host: Handle) -> LayoutEvidence<'_> {
+    let Some(entity) = doc.get_entity(host) else {
+        return LayoutEvidence::Missing;
+    };
+    let owner = entity.common().owner_handle;
+    let layouts: Vec<_> = doc
+        .objects
+        .values()
+        .filter_map(|o| match o {
+            ObjectType::Layout(l) if l.block_record == owner => Some(l),
+            _ => None,
+        })
+        .collect();
+    match layouts.as_slice() {
+        [layout]
+            if !layout.handle.is_null()
+                && !layout.block_record.is_null()
+                && matches!(doc.objects.get(&layout.handle), Some(ObjectType::Layout(l)) if l == *layout)
+                && doc
+                    .block_records
+                    .iter()
+                    .any(|r| r.handle == layout.block_record) =>
+        {
+            if doc.objects.values().filter(|o| matches!(o, ObjectType::Layout(l) if l.name.eq_ignore_ascii_case(&layout.name))).count() != 1 {
+                return LayoutEvidence::Ambiguous;
+            }
+            LayoutEvidence::Exact {
+                handle: layout.handle,
+                name: &layout.name,
+                block_record: layout.block_record,
+            }
+        }
+        [] => LayoutEvidence::Unsupported,
+        _ => LayoutEvidence::Ambiguous,
+    }
+}
+fn checked_text_host(doc: &CadDocument, host: Handle) -> bool {
+    matches!(
+        doc.get_entity(host),
+        Some(
+            EntityType::Text(_)
+                | EntityType::MText(_)
+                | EntityType::AttributeDefinition(_)
+                | EntityType::AttributeEntity(_)
+        )
+    )
+}
+pub fn evaluate_code_checked(
+    doc: &CadDocument,
+    request: PreviewRequest<'_>,
+    ctx: &dyn FieldContext,
+    interceptor: &dyn FieldInterceptor,
+) -> CheckedEvaluation {
+    let mut layout = request
+        .host
+        .map(|h| exact_host_layout(doc, h))
+        .unwrap_or(LayoutEvidence::Missing);
+    if request.host.is_some_and(|h| !checked_text_host(doc, h)) {
+        return CheckedEvaluation::Preserved(checked_diagnostic(
+            FieldDiagnosticCode::InvalidHost,
+            None,
+            request.host,
+            "Invalid preview text host",
+        ));
+    }
+    if let Some(handle) = request.layout {
+        let explicit = match doc.objects.get(&handle) {
+            Some(ObjectType::Layout(l)) if l.handle == handle && !handle.is_null() && !l.block_record.is_null()
+                && doc.block_records.iter().any(|r| r.handle == l.block_record)
+                && doc.objects.values().filter(|o| matches!(o,ObjectType::Layout(v) if v.name.eq_ignore_ascii_case(&l.name))).count() == 1 =>
+                LayoutEvidence::Exact { handle, name: &l.name, block_record: l.block_record },
+            _ => return CheckedEvaluation::Preserved(checked_diagnostic(FieldDiagnosticCode::InvalidHost, None, request.host, "Invalid explicit preview Layout")),
+        };
+        if request.host.is_some() && layout != explicit {
+            return CheckedEvaluation::Preserved(checked_diagnostic(
+                FieldDiagnosticCode::InvalidHost,
+                None,
+                request.host,
+                "Host/Layout conflict",
+            ));
+        }
+        layout = explicit;
+    }
+    let input = FieldEvaluation::Preview(VerifiedPreview {
+        document: doc,
+        code: request.code,
+        objects: request.objects,
+        host: request.host,
+        layout,
+    });
+    match interceptor.intercept(input) {
+        FieldDecision::HandledValue(value) => CheckedEvaluation::Value(value),
+        FieldDecision::HandledPreserve(mut diagnostic) => {
+            diagnostic.host = request.host;
+            CheckedEvaluation::Preserved(diagnostic)
+        }
+        FieldDecision::Delegate if acsm_family(request.code, "") => {
+            CheckedEvaluation::Preserved(checked_diagnostic(
+                FieldDiagnosticCode::UnhandledAcSm,
+                None,
+                request.host,
+                "AcSm requires an explicit strict decision",
+            ))
+        }
+        FieldDecision::Delegate => {
+            match evaluate_code(doc, request.code, request.objects, request.host, ctx) {
+                Some(display) => CheckedEvaluation::Value(ResolvedText { raw: None, display }),
+                None => CheckedEvaluation::Preserved(checked_diagnostic(
+                    FieldDiagnosticCode::EvaluationUnavailable,
+                    None,
+                    request.host,
+                    "Legacy evaluator unavailable",
+                )),
+            }
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldUpdateTrigger {
+    Event(i32),
+    SheetSetChange,
+}
+pub struct FieldUpdateSelection<'a> {
+    pub trigger: FieldUpdateTrigger,
+    pub hosts: Option<&'a [Handle]>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAccess {
+    Writable,
+    ReadOnly,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldUpdateReport {
+    pub changed_field_caches: Vec<Handle>,
+    pub changed_host_texts: Vec<Handle>,
+    pub changed_containers: Vec<Handle>,
+    pub persisted_mutation: bool,
+    pub preserved: Vec<FieldDiagnostic>,
+    pub failed: Vec<FieldDiagnostic>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldUpdateError {
+    pub message: String,
+}
+struct CheckedHostPlan {
+    host: Handle,
+    container: Handle,
+    fields: Vec<(Handle, Field)>,
+    text: String,
+    container_value: Option<Field>,
+}
+/// Opaque owned plan. The full document before-image is intentionally conservative:
+/// any intervening document edit invalidates it; no application generation is guessed.
+pub struct FieldUpdatePlan {
+    before: CadDocument,
+    hosts: Vec<CheckedHostPlan>,
+    report: FieldUpdateReport,
+}
+fn raw_identity<'a>(doc: &'a CadDocument, def: &FieldDef) -> Option<&'a Field> {
+    if doc.fields.get(&def.handle) != Some(def) {
+        return None;
+    }
+    match doc.objects.get(&def.handle) {
+        Some(ObjectType::Field(raw))
+            if raw.handle == def.handle
+                && raw.owner == def.owner
+                && raw.evaluator_id == def.evaluator
+                && raw.code == def.code
+                && raw.referenced_objects == def.objects =>
+        {
+            Some(raw)
+        }
+        _ => None,
+    }
+}
+fn verified_owner_host(doc: &CadDocument, start: Handle) -> Option<Handle> {
+    let mut seen = std::collections::HashSet::new();
+    let mut h = start;
+    for _ in 0..64 {
+        if !seen.insert(h) {
+            return None;
+        }
+        if doc.get_entity(h).is_some() {
+            return Some(h);
+        }
+        h = match doc.objects.get(&h)? {
+            ObjectType::Field(raw) => {
+                let def = doc.fields.get(&h)?;
+                raw_identity(doc, def)?;
+                raw.owner
+            }
+            ObjectType::Dictionary(d) => d.owner,
+            ObjectType::Unknown { owner, .. } => *owner,
+            _ => return None,
+        };
+    }
+    None
+}
+
+fn canonical_empty(value: &CellValue) -> bool {
+    value.text.is_empty()
+        && value.formatted_value.is_empty()
+        && value.numeric_value == 0.0
+        && value.handle_value.is_none()
+        && value.point_value == crate::types::Vector3::ZERO
+        && value.binary_value.is_empty()
+        && value.data_size == 0
+        && value.unit_type == crate::entities::table::ValueUnitType::NoUnits
+        && value.raw_unit_type_code == 0
+}
+fn checked_cache(
+    raw: &Field,
+    value: &ResolvedText,
+    delegated: Option<CellValue>,
+) -> Result<Field, &'static str> {
+    let mut after = raw.clone();
+    if let Some(fresh) = delegated {
+        if raw.value.value_type != fresh.value_type
+            || raw.value.raw_type_code != fresh.raw_type_code
+            || !matches!(raw.value.flags, 0 | 4)
+            || raw.value.raw_unit_type_code != 0
+        {
+            return Err("Unsupported delegated cache representation");
+        }
+        // Update only the known typed payload; unrelated CellValue metadata is retained.
+        match fresh.value_type {
+            CellValueType::String => {
+                after.value.text = fresh.text;
+                after.value.formatted_value = fresh.formatted_value;
+            }
+            CellValueType::Date => {
+                after.value.binary_value = fresh.binary_value;
+                after.value.data_size = fresh.data_size;
+                after.value.formatted_value = fresh.formatted_value;
+            }
+            _ => return Err("Unsupported delegated payload kind"),
+        }
+    } else if raw.value.value_type == CellValueType::String
+        && raw.value.raw_type_code == 4
+        && matches!(raw.value.flags, 0 | 4)
+    {
+        // Only string payload is modified; every other CellValue member is retained.
+        after.value.text = value.raw.clone().unwrap_or_else(|| value.display.clone());
+        after.value.formatted_value = value.display.clone();
+    } else if raw.value.value_type == CellValueType::Unknown
+        && raw.value.raw_type_code == 0
+        && raw.value.flags == 1
+        && canonical_empty(&raw.value)
+        && raw.state == 43
+        && raw.evaluation_status == 32
+        && raw.evaluation_error_code == 22
+        && raw.evaluation_error_message.is_empty()
+    {
+        after.value.value_type = CellValueType::String;
+        after.value.raw_type_code = 4;
+        after.value.flags = 4;
+        after.value.text = value.raw.clone().unwrap_or_else(|| value.display.clone());
+        after.value.formatted_value = value.display.clone();
+    } else {
+        return Err("Unsupported/vendor cache representation; retained unchanged");
+    }
+    after.value_string = value.display.clone();
+    after.value_string_length = value.display.encode_utf16().count() as i32;
+    after.evaluation_status = 2;
+    Ok(after)
+}
+fn checked_template(template: &str, shown: &[String], mtext: bool) -> Option<String> {
+    let mut rest = template;
+    while let Some(pos) = rest.find("%<") {
+        let marker = rest[pos..].strip_prefix("%<")?;
+        let end = marker.find(">%")?;
+        let index = marker[..end]
+            .strip_prefix("\\_FldIdx ")?
+            .trim()
+            .parse::<usize>()
+            .ok()?;
+        shown.get(index)?;
+        rest = &marker[end + 2..];
+    }
+    fill_template(template, shown, mtext)
+}
+fn checked_linkage(doc: &CadDocument, container: &FieldDef, host: Handle) -> bool {
+    let Some(entity) = doc.get_entity(host) else {
+        return false;
+    };
+    let Some(xdict) = entity.common().xdictionary_handle else {
+        return false;
+    };
+    let Some(ObjectType::Dictionary(x)) = doc.objects.get(&xdict) else {
+        return false;
+    };
+    let Some(field_dict) = x.get("ACAD_FIELD") else {
+        return false;
+    };
+    let Some(ObjectType::Dictionary(d)) = doc.objects.get(&field_dict) else {
+        return false;
+    };
+    x.owner == host
+        && d.owner == xdict
+        && d.get("TEXT") == Some(container.handle)
+        && container.owner == field_dict
+}
+impl CadDocument {
+    pub fn plan_field_updates(
+        &self,
+        ctx: &dyn FieldContext,
+        interceptor: &dyn FieldInterceptor,
+        selection: FieldUpdateSelection<'_>,
+    ) -> Result<FieldUpdatePlan, FieldUpdateError> {
+        if matches!(selection.trigger, FieldUpdateTrigger::Event(e) if e <= 0 || e & !63 != 0) {
+            return Err(FieldUpdateError {
+                message: "Invalid evaluation event mask".into(),
+            });
+        }
+        let mut plan = FieldUpdatePlan {
+            before: self.clone(),
+            hosts: Vec::new(),
+            report: FieldUpdateReport::default(),
+        };
+        let mut containers: Vec<_> = self
+            .fields
+            .values()
+            .filter(|f| f.evaluator == "_text")
+            .collect();
+        containers.sort_by_key(|f| u64::from(f.handle));
+        for container in containers {
+            let host = verified_owner_host(self, container.handle);
+            if selection
+                .hosts
+                .is_some_and(|only| host.is_some_and(|h| !only.contains(&h)))
+            {
+                continue;
+            }
+            let Some(host) = host.filter(|h| checked_text_host(self, *h)) else {
+                plan.report.failed.push(checked_diagnostic(
+                    FieldDiagnosticCode::InvalidHost,
+                    Some(container.handle),
+                    host,
+                    "Unsupported or broken host ownership",
+                ));
+                continue;
+            };
+            let failure =
+                |code, field, message| checked_diagnostic(code, Some(field), Some(host), message);
+            let mut kids: Vec<_> = self
+                .fields
+                .values()
+                .filter(|f| f.owner == container.handle)
+                .collect();
+            kids.sort_by_key(|f| u64::from(f.handle));
+            let Some(stored_container) = raw_identity(self, container) else {
+                plan.report.failed.push(failure(
+                    FieldDiagnosticCode::InvalidIdentity,
+                    container.handle,
+                    "Container identity mismatch",
+                ));
+                continue;
+            };
+            if !checked_linkage(self, container, host)
+                || self
+                    .fields
+                    .values()
+                    .filter(|c| {
+                        c.evaluator == "_text" && verified_owner_host(self, c.handle) == Some(host)
+                    })
+                    .count()
+                    != 1
+                || stored_container.child_fields
+                    != kids.iter().map(|k| k.handle).collect::<Vec<_>>()
+            {
+                plan.report.failed.push(failure(
+                    FieldDiagnosticCode::InvalidIdentity,
+                    container.handle,
+                    "Ambiguous/broken container linkage or child ordering",
+                ));
+                continue;
+            }
+            let mut shown = Vec::new();
+            let mut changes = Vec::new();
+            let mut blocked = false;
+            let mut resolved = false;
+            for kid in kids {
+                let Some(raw) = raw_identity(self, kid) else {
+                    plan.report.failed.push(failure(
+                        FieldDiagnosticCode::InvalidIdentity,
+                        kid.handle,
+                        "Child Field identity mismatch",
+                    ));
+                    blocked = true;
+                    break;
+                };
+                if self.fields.get(&kid.handle) != Some(kid) || kid.evaluator == "_text" {
+                    plan.report.failed.push(failure(
+                        FieldDiagnosticCode::InvalidIdentity,
+                        kid.handle,
+                        "Nested/mismatched child Field",
+                    ));
+                    blocked = true;
+                    break;
+                }
+                let selected = match selection.trigger {
+                    FieldUpdateTrigger::SheetSetChange => acsm_family(&kid.code, &kid.evaluator),
+                    FieldUpdateTrigger::Event(event) => {
+                        let enabled = drawing_fieldeval(self);
+                        raw.evaluation_option & (if event == 32 { event } else { event & enabled })
+                            != 0
+                    }
+                };
+                let cached = cached_value(self, kid.handle);
+                if !selected {
+                    shown.push(cached);
+                    continue;
+                }
+                let input = FieldEvaluation::Stored(VerifiedStoredField {
+                    document: self,
+                    definition: kid,
+                    stored: raw,
+                    container,
+                    trigger: selection.trigger,
+                    host,
+                    layout: exact_host_layout(self, host),
+                });
+                let (text, delegated) = match interceptor.intercept(input) {
+                    FieldDecision::HandledValue(value) => (value, None),
+                    FieldDecision::HandledPreserve(mut diagnostic) => {
+                        diagnostic.field = Some(kid.handle);
+                        diagnostic.host = Some(host);
+                        plan.report.preserved.push(diagnostic);
+                        blocked = true;
+                        break;
+                    }
+                    FieldDecision::Delegate if acsm_family(&kid.code, &kid.evaluator) => {
+                        plan.report.preserved.push(failure(
+                            FieldDiagnosticCode::UnhandledAcSm,
+                            kid.handle,
+                            "AcSm cannot delegate in checked mode",
+                        ));
+                        blocked = true;
+                        break;
+                    }
+                    FieldDecision::Delegate => {
+                        let plot = Plotting(ctx);
+                        let environment: &dyn FieldContext = if matches!(selection.trigger, FieldUpdateTrigger::Event(e) if e & 4 != 0)
+                        {
+                            &plot
+                        } else {
+                            ctx
+                        };
+                        let Some(display) = eval_field(self, kid, environment, host) else {
+                            plan.report.preserved.push(failure(
+                                FieldDiagnosticCode::EvaluationUnavailable,
+                                kid.handle,
+                                "Delegated evaluator unavailable; cached child retained",
+                            ));
+                            shown.push(cached);
+                            continue;
+                        };
+                        let fresh = plot_value(kid, &display, ctx.now_julian());
+                        (ResolvedText { raw: None, display }, Some(fresh))
+                    }
+                };
+                match checked_cache(raw, &text, delegated) {
+                    Ok(after) => {
+                        resolved = true;
+                        shown.push(text.display);
+                        if after != *raw {
+                            changes.push((kid.handle, after));
+                        }
+                    }
+                    Err(message) => {
+                        plan.report.preserved.push(failure(
+                            FieldDiagnosticCode::UnsupportedCache,
+                            kid.handle,
+                            message,
+                        ));
+                        blocked = true;
+                        break;
+                    }
+                }
+            }
+            if blocked {
+                plan.report.preserved.push(failure(
+                    FieldDiagnosticCode::BlockedByPreservedChild,
+                    container.handle,
+                    "Whole host retained; no partial cache application",
+                ));
+                continue;
+            }
+            if !resolved {
+                continue;
+            }
+            let Some(text) = checked_template(
+                &container.code,
+                &shown,
+                matches!(self.get_entity(host), Some(EntityType::MText(_))),
+            ) else {
+                plan.report.failed.push(failure(
+                    FieldDiagnosticCode::InvalidTemplate,
+                    container.handle,
+                    "Malformed container template",
+                ));
+                continue;
+            };
+            let checksum: Vec<_> = stored_container
+                .child_values
+                .iter()
+                .filter(|v| v.key == "ACFD_FIELDTEXT_CHECKSUM")
+                .collect();
+            if checksum.len() > 1
+                || checksum.iter().any(|v| {
+                    v.value.value_type != CellValueType::Double
+                        || v.value.raw_type_code != 2
+                        || v.value.flags != 2
+                        || v.value.handle_value.is_some()
+                        || !v.value.binary_value.is_empty()
+                        || v.value.data_size != 0
+                        || v.value.unit_type != crate::entities::table::ValueUnitType::NoUnits
+                        || v.value.raw_unit_type_code != 0
+                        || v.value.point_value != crate::types::Vector3::ZERO
+                        || !v.value.text.is_empty()
+                        || !v.value.formatted_value.is_empty()
+                        || !v.value.numeric_value.is_finite()
+                })
+            {
+                plan.report.preserved.push(failure(
+                    FieldDiagnosticCode::UnsupportedChecksum,
+                    container.handle,
+                    "Unsupported or duplicate checksum",
+                ));
+                continue;
+            }
+            let mut after_container = stored_container.clone();
+            for value in &mut after_container.child_values {
+                if value.key == "ACFD_FIELDTEXT_CHECKSUM" {
+                    value.value.numeric_value = field_text_checksum(&text);
+                }
+            }
+            plan.hosts.push(CheckedHostPlan {
+                host,
+                container: container.handle,
+                fields: changes,
+                text,
+                container_value: (after_container != *stored_container).then_some(after_container),
+            });
+        }
+        Ok(plan)
+    }
+    pub fn apply_field_updates(
+        &mut self,
+        plan: FieldUpdatePlan,
+        access: CacheAccess,
+    ) -> FieldUpdateReport {
+        let mut report = plan.report;
+        if access == CacheAccess::ReadOnly || *self != plan.before {
+            let code = if access == CacheAccess::ReadOnly {
+                FieldDiagnosticCode::ReadOnly
+            } else {
+                FieldDiagnosticCode::StalePlan
+            };
+            for host in plan.hosts {
+                let diagnostic = checked_diagnostic(
+                    code.clone(),
+                    Some(host.container),
+                    Some(host.host),
+                    "Checked plan not applied",
+                );
+                if access == CacheAccess::ReadOnly {
+                    report.preserved.push(diagnostic);
+                } else {
+                    report.failed.push(diagnostic);
+                }
+            }
+            return report;
+        }
+        for host in plan.hosts {
+            // Commit through a candidate so even a failed host write cannot expose partial caches.
+            let mut candidate = self.clone();
+            let old = candidate.text_host(host.host, |_, text, _| {
+                std::mem::replace(text, host.text.clone())
+            });
+            let Some(old) = old else {
+                report.failed.push(checked_diagnostic(
+                    FieldDiagnosticCode::InvalidHost,
+                    Some(host.container),
+                    Some(host.host),
+                    "Host disappeared",
+                ));
+                continue;
+            };
+            let text_changed = old != host.text;
+            let field_changed = !host.fields.is_empty();
+            for (handle, value) in host.fields {
+                candidate.objects.insert(handle, ObjectType::Field(value));
+                report.changed_field_caches.push(handle);
+            }
+            let container_changed = host.container_value.is_some();
+            if let Some(value) = host.container_value {
+                candidate
+                    .objects
+                    .insert(host.container, ObjectType::Field(value));
+                report.changed_containers.push(host.container);
+            }
+            if text_changed {
+                report.changed_host_texts.push(host.host);
+            }
+            if text_changed || field_changed || container_changed {
+                *self = candidate;
+                report.persisted_mutation = true;
+            }
+        }
+        report.changed_field_caches.sort_by_key(|h| u64::from(*h));
+        report.changed_field_caches.dedup();
+        report.changed_host_texts.sort_by_key(|h| u64::from(*h));
+        report.changed_host_texts.dedup();
+        report.changed_containers.sort_by_key(|h| u64::from(*h));
+        report.changed_containers.dedup();
+        report
+    }
+}
+fn drawing_fieldeval(doc: &CadDocument) -> i32 {
+    let mut values = Vec::new();
+    for object in doc.objects.values() {
+        let entries = match object {
+            ObjectType::Dictionary(d) => &d.entries,
+            ObjectType::DictionaryWithDefault(d) => &d.entries,
+            _ => continue,
+        };
+        for (key, handle) in entries {
+            if key.eq_ignore_ascii_case("FIELDEVAL") {
+                if let Some(ObjectType::DictionaryVariable(v)) = doc.objects.get(handle) {
+                    values.push(v.value.trim().parse::<i32>().unwrap_or(31));
+                }
+            }
+        }
+    }
+    match values.as_slice() {
+        [] => 31,
+        [value] => *value,
+        _ => 0,
+    }
+}
