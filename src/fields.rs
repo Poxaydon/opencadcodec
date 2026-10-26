@@ -4512,3 +4512,291 @@ fn drawing_fieldeval(doc: &CadDocument) -> i32 {
         _ => 0,
     }
 }
+
+// Opt-in attachment safety. Legacy attachment entry points above are unchanged.
+/// AcSm is always deferred by the opt-in API. Other evaluators may also be deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributeFieldEvaluation {
+    Evaluate,
+    Defer,
+}
+/// Copying an ATTDEF Field creates a new identity, never moves/duplicates its source handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedFieldIdentity {
+    pub source: Handle,
+    pub target: Handle,
+    pub host: Handle,
+    pub deferred: bool,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttributeFieldAttachmentReport {
+    pub attached_hosts: Vec<Handle>,
+    pub fields: Vec<AttachedFieldIdentity>,
+    pub preserved: Vec<FieldDiagnostic>,
+}
+
+impl CadDocument {
+    /// Copy ATTDEF Fields to ATTRIBs without evaluating AcSm, including unknown/malformed
+    /// AcSm versions. `policy` can additionally defer any non-AcSm child; Evaluate only
+    /// enables the existing non-AcSm evaluation behavior. No strict context is guessed.
+    ///
+    /// Deferred records retain their expression, cache representation, evaluation metadata
+    /// and XDATA. Only the new copy's handle/owner are rebound. Source Fields are untouched.
+    /// Existing target Field linkages are retained rather than replaced. Unsupported source
+    /// linkage/templates preserve the entire attribute. Each successful attribute publishes
+    /// through a candidate; failed attachment does not consume handles or partially mutate it.
+    ///
+    /// This API deliberately does not map deferred expressions (including ?BlockRefId).
+    /// Callers needing mapped AcSm must defer that separate explicit editing operation.
+    pub fn attach_attribute_fields_with_policy(
+        &mut self,
+        insert: Handle,
+        ctx: &dyn FieldContext,
+        policy: &dyn Fn(&FieldDef) -> AttributeFieldEvaluation,
+    ) -> AttributeFieldAttachmentReport {
+        let mut report = AttributeFieldAttachmentReport::default();
+        let (block, attributes) = match self.get_entity(insert) {
+            Some(EntityType::Insert(i)) => (i.block_name.clone(), i.attributes.clone()),
+            _ => {
+                report.preserved.push(FieldDiagnostic::preserve(
+                    "Attachment target is not an INSERT",
+                ));
+                return report;
+            }
+        };
+        for (index, attribute) in attributes.iter().enumerate() {
+            let fail = |message| {
+                checked_diagnostic(
+                    FieldDiagnosticCode::InvalidIdentity,
+                    None,
+                    Some(attribute.common.handle),
+                    message,
+                )
+            };
+            let defs: Vec<_> = self
+                .entities_in_block(&block)
+                .filter_map(|e| match e {
+                    EntityType::AttributeDefinition(d)
+                        if d.tag.eq_ignore_ascii_case(&attribute.tag) =>
+                    {
+                        Some(d.common.handle)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if defs.is_empty() {
+                continue;
+            }
+            if defs.len() != 1
+                || attributes
+                    .iter()
+                    .filter(|a| a.tag.eq_ignore_ascii_case(&attribute.tag))
+                    .count()
+                    != 1
+            {
+                report
+                    .preserved
+                    .push(fail("Ambiguous attribute/definition tag"));
+                continue;
+            }
+            let Some(container) = container_for_host(self, defs[0]).cloned() else {
+                continue;
+            };
+            let Some(source_container) = raw_identity(self, &container).cloned() else {
+                report
+                    .preserved
+                    .push(fail("Source container identity mismatch"));
+                continue;
+            };
+            let mut kids: Vec<_> = self
+                .fields
+                .values()
+                .filter(|f| f.owner == container.handle)
+                .cloned()
+                .collect();
+            kids.sort_by_key(|f| u64::from(f.handle));
+            let source_fields: Option<Vec<_>> = kids
+                .iter()
+                .map(|k| raw_identity(self, k).cloned())
+                .collect();
+            let Some(source_fields) = source_fields else {
+                report
+                    .preserved
+                    .push(fail("Source child identity mismatch"));
+                continue;
+            };
+            if !checked_linkage(self, &container, defs[0])
+                || source_container.child_fields
+                    != kids.iter().map(|k| k.handle).collect::<Vec<_>>()
+                || source_fields
+                    .iter()
+                    .any(|f| !f.child_fields.is_empty() || f.evaluator_id == "_text")
+            {
+                report
+                    .preserved
+                    .push(fail("Unsupported source linkage/nested Fields"));
+                continue;
+            }
+            if let Some(xdict) = attribute.common.xdictionary_handle {
+                match self.objects.get(&xdict) {
+                    Some(ObjectType::Dictionary(d))
+                        if d.owner == attribute.common.handle && d.get("ACAD_FIELD").is_none() => {}
+                    _ => {
+                        report
+                            .preserved
+                            .push(fail("Existing/unknown target Field linkage retained"));
+                        continue;
+                    }
+                }
+            }
+            let mut candidate = self.clone();
+            let host = if attribute.common.handle.is_null() {
+                candidate.allocate_handle()
+            } else {
+                attribute.common.handle
+            };
+            if !attribute.common.handle.is_null()
+                && (attribute.common.owner_handle != insert
+                    || self.get_entity(host).is_some()
+                    || self.objects.contains_key(&host)
+                    || self
+                        .entities()
+                        .filter_map(|e| match e {
+                            EntityType::Insert(i) => Some(i.attributes.iter()),
+                            _ => None,
+                        })
+                        .flatten()
+                        .filter(|a| a.common.handle == host)
+                        .count()
+                        != 1)
+            {
+                report
+                    .preserved
+                    .push(fail("Ambiguous/mismatched target attribute handle"));
+                continue;
+            }
+            if let Some(EntityType::Insert(i)) = candidate.get_entity_mut(insert) {
+                i.attributes[index].common.handle = host;
+                i.attributes[index].common.owner_handle = insert;
+            }
+            let deferred: Vec<_> = kids
+                .iter()
+                .map(|k| {
+                    acsm_family(&k.code, &k.evaluator)
+                        || policy(k) == AttributeFieldEvaluation::Defer
+                })
+                .collect();
+            let mut children = Vec::new();
+            let mut shown = Vec::new();
+            for ((k, raw), defer) in kids.iter().zip(&source_fields).zip(&deferred) {
+                if *defer {
+                    let display = cached_value(self, k.handle);
+                    shown.push(display);
+                    children.push(NewField {
+                        evaluator: k.evaluator.clone(),
+                        code: k.code.clone(),
+                        objects: k.objects.clone(),
+                        value: raw.value.clone(),
+                        evaluation_option: raw.evaluation_option,
+                    });
+                } else {
+                    let placeholder = k.code.contains("?BlockRefId");
+                    let code = k.code.replace("?BlockRefId", "%<\\_ObjIdx 0>%");
+                    let objects = if placeholder {
+                        vec![insert]
+                    } else {
+                        k.objects.clone()
+                    };
+                    let display = evaluate_code(&candidate, &code, &objects, Some(host), ctx)
+                        .unwrap_or_else(|| raw.value.display().to_string());
+                    shown.push(display.clone());
+                    let mut child = NewField::new(code, display);
+                    child.objects = objects;
+                    child.evaluation_option = raw.evaluation_option;
+                    children.push(child);
+                }
+            }
+            let Some(display) = checked_template(&container.code, &shown, false) else {
+                report
+                    .preserved
+                    .push(fail("Malformed source template retained"));
+                continue;
+            };
+            let checksum: Vec<_> = source_container
+                .child_values
+                .iter()
+                .filter(|v| v.key == "ACFD_FIELDTEXT_CHECKSUM")
+                .collect();
+            if checksum.len() > 1
+                || checksum.iter().any(|v| {
+                    v.value.value_type != CellValueType::Double
+                        || v.value.raw_type_code != 2
+                        || v.value.flags != 2
+                        || !v.value.numeric_value.is_finite()
+                })
+            {
+                report
+                    .preserved
+                    .push(fail("Unsupported source checksum retained"));
+                continue;
+            }
+            // Author only fresh linkage on the candidate. Replace deferred raw records
+            // before publication, so no normalized cache is exposed or stored.
+            let Some(target_container) = candidate.set_text_field(host, &container.code, children)
+            else {
+                report
+                    .preserved
+                    .push(fail("Target attachment could not be authored"));
+                continue;
+            };
+            let target = candidate.fields.get(&target_container).unwrap().clone();
+            let target_children = match candidate.objects.get(&target_container) {
+                Some(ObjectType::Field(f)) => f.child_fields.clone(),
+                _ => unreachable!(),
+            };
+            let mut cloned_container = source_container.clone();
+            cloned_container.handle = target_container;
+            cloned_container.owner = target.owner;
+            cloned_container.child_fields = target_children.clone();
+            cloned_container
+                .child_values
+                .retain(|v| v.key != "ACFD_FIELDTEXT_ATTDEF");
+            for value in &mut cloned_container.child_values {
+                if value.key == "ACFD_FIELDTEXT_CHECKSUM" {
+                    value.value.numeric_value = field_text_checksum(&display);
+                }
+            }
+            let mut records = vec![cloned_container];
+            let mut identities = Vec::new();
+            for (((raw, defer), handle), source) in source_fields
+                .iter()
+                .zip(&deferred)
+                .zip(target_children)
+                .zip(&kids)
+            {
+                if *defer {
+                    let mut clone = raw.clone();
+                    clone.handle = handle;
+                    clone.owner = target_container;
+                    records.push(clone);
+                }
+                identities.push(AttachedFieldIdentity {
+                    source: source.handle,
+                    target: handle,
+                    host,
+                    deferred: *defer,
+                });
+            }
+            for record in records {
+                candidate
+                    .objects
+                    .insert(record.handle, ObjectType::Field(record));
+            }
+            candidate.text_host(host, |_, text, _| *text = display);
+            *self = candidate;
+            report.attached_hosts.push(host);
+            report.fields.extend(identities);
+        }
+        report
+    }
+}
