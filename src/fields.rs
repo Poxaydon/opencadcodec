@@ -3871,11 +3871,85 @@ fn acsm_family(code: &str, evaluator: &str) -> bool {
     .iter()
     .any(|s| s.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("AcSm")))
 }
+// A checked host is borrowed from its real storage; nested ATTRIBs are never
+// inserted into the top-level entity index. Ambiguous handles fail closed.
+struct CheckedTextHost<'a> {
+    common: &'a EntityCommon,
+    layout_owner: Handle,
+    nested: bool,
+}
+fn checked_host(doc: &CadDocument, host: Handle) -> Option<CheckedTextHost<'_>> {
+    if host.is_null() || doc.objects.contains_key(&host) {
+        return None;
+    }
+    let mut attributes = doc
+        .entities()
+        .filter_map(|entity| match entity {
+            EntityType::Insert(insert) => Some(insert),
+            _ => None,
+        })
+        .flat_map(|insert| {
+            insert
+                .attributes
+                .iter()
+                .map(move |attribute| (insert, attribute))
+        })
+        .filter(|(_, attribute)| attribute.common.handle == host);
+    let nested = attributes.next();
+    if attributes.next().is_some() {
+        return None;
+    }
+    if let Some(entity) = doc.get_entity(host) {
+        if nested.is_some()
+            || entity.common().handle != host
+            || doc.entities().filter(|e| e.common().handle == host).count() != 1
+            || !matches!(
+                entity,
+                EntityType::Text(_)
+                    | EntityType::MText(_)
+                    | EntityType::AttributeDefinition(_)
+                    | EntityType::AttributeEntity(_)
+            )
+        {
+            return None;
+        }
+        return Some(CheckedTextHost {
+            common: entity.common(),
+            layout_owner: entity.common().owner_handle,
+            nested: false,
+        });
+    }
+    let (insert, attribute) = nested?;
+    let parent = insert.common.handle;
+    if parent.is_null()
+        || doc.entities().any(|e| e.common().handle == host)
+        || parent == host
+        || attribute.common.owner_handle != parent
+        || doc.objects.contains_key(&parent)
+        || !matches!(doc.get_entity(parent), Some(EntityType::Insert(indexed)) if std::ptr::eq(indexed, insert))
+        || doc
+            .entities()
+            .filter(|e| e.common().handle == parent)
+            .count()
+            != 1
+        || doc.entities().any(|e| match e {
+            EntityType::Insert(i) => i.attributes.iter().any(|a| a.common.handle == parent),
+            _ => false,
+        })
+    {
+        return None;
+    }
+    Some(CheckedTextHost {
+        common: &attribute.common,
+        layout_owner: insert.common.owner_handle,
+        nested: true,
+    })
+}
 fn exact_host_layout(doc: &CadDocument, host: Handle) -> LayoutEvidence<'_> {
-    let Some(entity) = doc.get_entity(host) else {
+    let Some(verified) = checked_host(doc, host) else {
         return LayoutEvidence::Missing;
     };
-    let owner = entity.common().owner_handle;
+    let owner = verified.layout_owner;
     let layouts: Vec<_> = doc
         .objects
         .values()
@@ -3892,7 +3966,14 @@ fn exact_host_layout(doc: &CadDocument, host: Handle) -> LayoutEvidence<'_> {
                 && doc
                     .block_records
                     .iter()
-                    .any(|r| r.handle == layout.block_record) =>
+                    .any(|r| r.handle == layout.block_record)
+                && (!verified.nested
+                    || doc
+                        .block_records
+                        .iter()
+                        .filter(|r| r.handle == layout.block_record)
+                        .count()
+                        == 1) =>
         {
             if doc.objects.values().filter(|o| matches!(o, ObjectType::Layout(l) if l.name.eq_ignore_ascii_case(&layout.name))).count() != 1 {
                 return LayoutEvidence::Ambiguous;
@@ -3908,15 +3989,9 @@ fn exact_host_layout(doc: &CadDocument, host: Handle) -> LayoutEvidence<'_> {
     }
 }
 fn checked_text_host(doc: &CadDocument, host: Handle) -> bool {
-    matches!(
-        doc.get_entity(host),
-        Some(
-            EntityType::Text(_)
-                | EntityType::MText(_)
-                | EntityType::AttributeDefinition(_)
-                | EntityType::AttributeEntity(_)
-        )
-    )
+    checked_host(doc, host).is_some_and(|verified| {
+        !verified.nested || matches!(exact_host_layout(doc, host), LayoutEvidence::Exact { .. })
+    })
 }
 pub fn evaluate_code_checked(
     doc: &CadDocument,
@@ -4053,8 +4128,13 @@ fn verified_owner_host(doc: &CadDocument, start: Handle) -> Option<Handle> {
         if !seen.insert(h) {
             return None;
         }
-        if doc.get_entity(h).is_some() {
-            return Some(h);
+        if doc.get_entity(h).is_some()
+            || doc.entities().any(|e| match e {
+                EntityType::Insert(i) => i.attributes.iter().any(|a| a.common.handle == h),
+                _ => false,
+            })
+        {
+            return checked_host(doc, h).map(|_| h);
         }
         h = match doc.objects.get(&h)? {
             ObjectType::Field(raw) => {
@@ -4069,7 +4149,6 @@ fn verified_owner_host(doc: &CadDocument, start: Handle) -> Option<Handle> {
     }
     None
 }
-
 fn canonical_empty(value: &CellValue) -> bool {
     value.text.is_empty()
         && value.formatted_value.is_empty()
@@ -4153,10 +4232,10 @@ fn checked_template(template: &str, shown: &[String], mtext: bool) -> Option<Str
     fill_template(template, shown, mtext)
 }
 fn checked_linkage(doc: &CadDocument, container: &FieldDef, host: Handle) -> bool {
-    let Some(entity) = doc.get_entity(host) else {
+    let Some(verified) = checked_host(doc, host) else {
         return false;
     };
-    let Some(xdict) = entity.common().xdictionary_handle else {
+    let Some(xdict) = verified.common.xdictionary_handle else {
         return false;
     };
     let Some(ObjectType::Dictionary(x)) = doc.objects.get(&xdict) else {
@@ -4168,7 +4247,22 @@ fn checked_linkage(doc: &CadDocument, container: &FieldDef, host: Handle) -> boo
     let Some(ObjectType::Dictionary(d)) = doc.objects.get(&field_dict) else {
         return false;
     };
-    x.owner == host
+    (!verified.nested
+        || (!xdict.is_null()
+            && !field_dict.is_null()
+            && x.handle == xdict
+            && d.handle == field_dict
+            && x.entries
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("ACAD_FIELD"))
+                .count()
+                == 1
+            && d.entries
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("TEXT"))
+                .count()
+                == 1))
+        && x.owner == host
         && d.owner == xdict
         && d.get("TEXT") == Some(container.handle)
         && container.owner == field_dict
